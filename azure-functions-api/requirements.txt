@@ -1,0 +1,9 @@
+# Uncomment to enable Azure Monitor OpenTelemetry
+Ref: aka.ms/functions-azure-monitor-python
+azure-monitor-opentelemetry
+azure-functions
+openai>=1.12.0
+azure-identity
+azure-search-documents>=11.4.0
+python-dotenv
+requests
