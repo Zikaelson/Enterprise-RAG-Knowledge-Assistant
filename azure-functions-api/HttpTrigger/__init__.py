@@ -66,7 +66,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         # 5. Extract answer and return JSON
-        answer = response.choices[0].message["content"]
+        answer = response.choices[0].message.content
 
         return func.HttpResponse(
             json.dumps({"answer": answer}),
