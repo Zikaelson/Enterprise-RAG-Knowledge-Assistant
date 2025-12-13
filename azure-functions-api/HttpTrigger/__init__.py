@@ -31,7 +31,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         search_index = os.environ["AZURE_SEARCH_INDEX"]
         search_key = os.environ["AZURE_AISEARCH_KEY"]
 
-        # 3. Create Azure OpenAI client (using API key auth)
+        # 3. Create Azure OpenAI client (API key auth)
         client = AzureOpenAI(
             azure_endpoint=endpoint,
             api_key=openai_key,
@@ -65,10 +65,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             },
         )
 
-        # 5. Extract answer text from the response
+        # 5. Extract answer and return JSON
         answer = response.choices[0].message["content"]
 
-        # 6. Return plain text or JSON as you prefer
         return func.HttpResponse(
             json.dumps({"answer": answer}),
             mimetype="application/json",
@@ -76,9 +75,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        # Basic error reporting
+        # LOG the error so it appears in the Logs pane
+        print(f"ERROR IN FUNCTION: {repr(e)}")
+
+        # Return the error text so we can see it in Test/Run → Output
         return func.HttpResponse(
-            json.dumps({"error": str(e)}),
+            json.dumps({"error": repr(e)}),
             mimetype="application/json",
             status_code=500,
         )
