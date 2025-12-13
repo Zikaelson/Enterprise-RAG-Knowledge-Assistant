@@ -75,12 +75,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        # LOG the error so it appears in the Logs pane
-        print(f"ERROR IN FUNCTION: {repr(e)}")
-
-        # Return the error text so we can see it in Test/Run → Output
-        return func.HttpResponse(
-            json.dumps({"error": repr(e)}),
-            mimetype="application/json",
-            status_code=500,
-        )
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        return func.HttpResponse(tb, status_code=500)
