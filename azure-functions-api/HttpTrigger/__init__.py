@@ -84,24 +84,60 @@
 
 import json
 import os
+import re
+import html
+
 import azure.functions as func
 from openai import AzureOpenAI
 
 
+def clean_text(s: str) -> str:
+    """Cleans text for UI: unescape HTML, normalize whitespace/newlines."""
+    if not s:
+        return ""
+    s = html.unescape(s)                 # &amp; -> &
+    s = s.replace("\r\n", "\n")
+    s = re.sub(r"[ \t]+", " ", s)        # collapse spaces/tabs
+    s = re.sub(r"\n{3,}", "\n\n", s)     # collapse excessive newlines
+    return s.strip()
+
+
+def excerpt_around_keyword(text: str, keyword: str, max_chars: int = 700) -> str:
+    """
+    Returns a short, readable excerpt from a long citation.
+    Tries to center around the first occurrence of keyword; otherwise returns start.
+    """
+    text = clean_text(text)
+    if not text:
+        return ""
+
+    if not keyword:
+        return text[:max_chars] + ("..." if len(text) > max_chars else "")
+
+    idx = text.lower().find(keyword.lower())
+    if idx == -1:
+        snippet = text[:max_chars]
+        return snippet + ("..." if len(text) > max_chars else "")
+
+    start = max(idx - int(max_chars * 0.35), 0)
+    end = min(start + max_chars, len(text))
+    snippet = text[start:end]
+
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet
+
+
 def _safe_model_dump(obj):
-    """
-    Tries to convert SDK objects into plain dicts safely.
-    Works across OpenAI SDK versions.
-    """
+    """Convert SDK objects into plain dicts across OpenAI SDK versions."""
     if obj is None:
         return None
-    # Newer pydantic-based objects
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
-    # Older versions sometimes have to_dict()
     if hasattr(obj, "to_dict"):
         return obj.to_dict()
-    # Last resort: try JSON serialization fallback
     try:
         return json.loads(json.dumps(obj, default=lambda x: getattr(x, "__dict__", str(x))))
     except Exception:
@@ -109,40 +145,22 @@ def _safe_model_dump(obj):
 
 
 def _find_citations(resp_dict: dict):
-    """
-    Azure "On your data" citations appear in different places depending on API/SDK.
-    We check the most common locations and return a list of citation dicts.
-    """
+    """Find Azure On-Your-Data citations across common response shapes."""
     if not isinstance(resp_dict, dict):
         return []
 
     citations = []
 
-    # Most common: choices[0].message.context.citations (Azure OpenAI "on your data")
+    # Common: choices[0].message.context.citations
     try:
-        ctx = (
-            resp_dict.get("choices", [{}])[0]
-            .get("message", {})
-            .get("context", {})
-        )
+        ctx = resp_dict.get("choices", [{}])[0].get("message", {}).get("context", {})
         cits = ctx.get("citations", [])
         if isinstance(cits, list):
             citations.extend(cits)
     except Exception:
         pass
 
-    # Sometimes: choices[0].message.model_extra.context.citations (SDK variations)
-    # model_extra isn't always in model_dump; but if it is, it may show here.
-    try:
-        msg = resp_dict.get("choices", [{}])[0].get("message", {})
-        extra_ctx = msg.get("model_extra", {}).get("context", {})
-        cits = extra_ctx.get("citations", [])
-        if isinstance(cits, list):
-            citations.extend(cits)
-    except Exception:
-        pass
-
-    # Sometimes: resp has a top-level "citations"
+    # Sometimes: top-level citations
     try:
         cits = resp_dict.get("citations", [])
         if isinstance(cits, list):
@@ -150,7 +168,7 @@ def _find_citations(resp_dict: dict):
     except Exception:
         pass
 
-    # De-dup by a stable key if present
+    # De-dup
     seen = set()
     unique = []
     for c in citations:
@@ -171,22 +189,40 @@ def _find_citations(resp_dict: dict):
     return unique
 
 
-def _normalize_citations(citations: list):
+def _normalize_citations(citations: list, user_question: str):
     """
-    Normalizes raw citations into a stable UI-friendly schema.
+    Normalize raw citations into stable schema + clean, short excerpt.
+    We prefer excerpts around likely anchors (Classification) or the user's query.
     """
     normalized = []
+    q_anchor = (user_question or "").strip()
     for c in citations:
         if not isinstance(c, dict):
             continue
 
+        title = c.get("title") or c.get("file") or c.get("filename") or None
+        filepath = c.get("filepath") or c.get("path") or None
+        url = c.get("url") or c.get("source_url") or None
+        chunk_id = c.get("chunk_id") or c.get("id") or None
+
+        raw = c.get("content") or c.get("excerpt") or c.get("text") or ""
+
+        # Pick a good anchor for excerpting:
+        # 1) "Classification" (works for your policy docs)
+        # 2) fall back to user's question if it's short enough
+        anchor = "Classification"
+        if q_anchor and len(q_anchor) <= 80:
+            anchor = q_anchor
+
+        content = excerpt_around_keyword(raw, anchor, max_chars=700)
+
         normalized.append({
-            # Common fields seen in Azure citations
-            "title": c.get("title") or c.get("file") or c.get("filename") or None,
-            "filepath": c.get("filepath") or c.get("path") or None,
-            "url": c.get("url") or c.get("source_url") or None,
-            "chunk_id": c.get("chunk_id") or c.get("id") or None,
-            "content": c.get("content") or c.get("excerpt") or c.get("text") or None,
+            "source_id": chunk_id,
+            "title": title,
+            "filepath": filepath,
+            "url": url,
+            "chunk_id": chunk_id,
+            "content": content
         })
 
     return normalized
@@ -236,9 +272,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     "role": "system",
                     "content": (
                         "You are Zik Consultancy AI Assistant. "
-                        "Answer ONLY using the documents in Azure AI Search. "
-                        "If the answer is not in the documents, say: 'I don't know based on the provided documents.' "
-                        "Where possible, ground key claims in citations."
+                        "Answer ONLY using the documents provided via Azure AI Search. "
+                        "If the answer is not present, say: \"I don't know based on the provided documents.\" "
+                        "Do NOT include bracket tags like [doc1]; citations are returned separately. "
+                        "Keep answers concise and structured."
                     ),
                 },
                 {"role": "user", "content": user_question},
@@ -254,20 +291,24 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                                 "type": "api_key",
                                 "key": search_key,
                             },
+                            # Optional tuning knobs (safe defaults)
+                            "top_n_documents": 5,
+                            "strictness": 3
                         },
                     }
                 ]
             },
         )
 
-        # ---- 5) Extract answer + citations ----
-        answer = response.choices[0].message.content
+        # ---- 5) Extract answer + clean doc tags just in case ----
+        answer = response.choices[0].message.content or ""
+        answer = re.sub(r"\s*\[doc\d+\]", "", answer).strip()
 
+        # ---- 6) Extract citations + normalize for UI ----
         resp_dict = _safe_model_dump(response)
         raw_citations = _find_citations(resp_dict)
-        citations = _normalize_citations(raw_citations)
+        citations = _normalize_citations(raw_citations, user_question)
 
-        # Try to expose a request id for troubleshooting if present
         request_id = None
         try:
             request_id = resp_dict.get("id")
@@ -286,7 +327,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        # Return a readable error without leaking secrets
+        # Production-safe: return error string without secrets
         return func.HttpResponse(
             json.dumps({"error": str(e)}),
             mimetype="application/json",
